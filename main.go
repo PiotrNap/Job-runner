@@ -11,6 +11,15 @@ import (
 	"time"
 )
 
+type JobStatus string
+
+const (
+	JobQueued    JobStatus = "queued"
+	JobRunning   JobStatus = "running"
+	JobSucceeded JobStatus = "succeeded"
+	JobFailed    JobStatus = "failed"
+)
+
 type JobType string
 
 const (
@@ -18,10 +27,13 @@ const (
 )
 
 type Job struct {
-	ID      int     `json:"id"`
-	Type    JobType `json:"type"`
-	Payload string  `json:"payload"`
-	Status  string  `json:"status"`
+	ID         int        `json:"id"`
+	Type       JobType    `json:"type"`
+	Payload    string     `json:"payload"`
+	Status     JobStatus  `json:"status"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	StartedAt  *time.Time `json:"startedAt"`
+	FinishedAt *time.Time `json:"finishedAt"`
 }
 
 type Jobs []Job
@@ -35,35 +47,61 @@ var (
 
 func slowWork(ctx context.Context) error {
 	select {
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		fmt.Println("work completed")
+		return nil
 	case <-ctx.Done():
 		fmt.Println("work cancelled")
+		return ctx.Err()
 	}
-
-	return nil
 }
 
 func worker(workerId int, queue <-chan int) {
 	for id := range queue {
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			1*time.Second)
+
 		fmt.Printf("Worker of ID %v, executing job %v\n", workerId, id)
-		processJob(id)
+
+		err := processJob(ctx, id)
+		cancel()
+
+		fmt.Println(err)
 	}
 }
 
-func processJob(id int) {
-	time.Sleep(2 * time.Second)
-
+func processJob(ctx context.Context, id int) error {
 	mu.Lock()
-	defer mu.Unlock()
 
 	job, ok := jobs[id]
 	if !ok {
-		return
+		mu.Unlock()
+		return fmt.Errorf("job with an ID: %v, doesn't exist", id)
 	}
-
-	job.Status = "success"
+	startedAt := time.Now()
+	job.StartedAt = &startedAt
+	job.Status = JobRunning
 	jobs[id] = job
+
+	mu.Unlock()
+
+	err := slowWork(ctx)
+
+	mu.Lock()
+
+	if err != nil {
+		job.Status = JobFailed
+	} else {
+		job.Status = JobSucceeded
+	}
+	finishedAt := time.Now()
+	job.FinishedAt = &finishedAt
+	jobs[id] = job
+
+	mu.Unlock()
+
+	return err
 }
 
 func checkHealth(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +125,8 @@ func postJob(w http.ResponseWriter, r *http.Request) {
 
 	job.ID = nextId
 	nextId++
-	job.Status = "pending"
+	job.Status = JobQueued
+	job.CreatedAt = time.Now()
 	jobs[job.ID] = job
 
 	select {
