@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -43,6 +46,7 @@ var (
 	jobQueue = make(chan int, 10)
 	nextId   = 1
 	mu       sync.Mutex
+	wg       sync.WaitGroup
 )
 
 func slowWork(ctx context.Context) error {
@@ -57,6 +61,8 @@ func slowWork(ctx context.Context) error {
 }
 
 func worker(workerId int, queue <-chan int) {
+	defer wg.Done()
+
 	for id := range queue {
 		ctx, cancel := context.WithTimeout(
 			context.Background(),
@@ -174,14 +180,35 @@ func getJobById(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func runServer() {
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func listenAndClean() {
+	ctx, done := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	defer done()
+
+	<-ctx.Done()
+
+	fmt.Println("Signal received, shutting down gracefully...")
+}
+
 func main() {
 	http.HandleFunc("/health", checkHealth)
 	http.HandleFunc("POST /jobs", postJob)
 	http.HandleFunc("GET /jobs/{id}", getJobById)
 
 	for wId := range 3 {
+		wg.Add(1)
 		go worker(wId, jobQueue)
 	}
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	go runServer()
+
+	listenAndClean()
+
+	close(jobQueue)
+
+	wg.Wait()
 }
